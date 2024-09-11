@@ -1,5 +1,4 @@
 use std::{
-    cmp::Ordering,
     fs::{File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
     mem,
@@ -25,8 +24,7 @@ struct Row {
 
 struct Cursor<'a> {
     table: &'a mut Table,
-    page_num: usize,
-    cell_num: usize,
+    row_num: usize,
     end_of_table: bool,
 }
 
@@ -73,46 +71,38 @@ impl<'a> Cursor<'a> {
         let end_of_table = table.num_rows == 0;
         let cursor = Cursor {
             table,
-            page_num: 0,
-            cell_num: 0,
+            row_num: 0,
             end_of_table,
         };
         Ok(cursor)
     }
 
     fn table_end(table: &'a mut Table) -> io::Result<Cursor<'a>> {
-        let page_num = table.num_rows / ROWS_PER_PAGE;
-        let cell_num = table.num_rows % ROWS_PER_PAGE;
+        let num_rows = table.num_rows;
         let cursor = Cursor {
             table,
-            page_num,
-            cell_num,
+            row_num: num_rows,
             end_of_table: true,
         };
         Ok(cursor)
     }
 
     fn advance(&mut self) -> io::Result<()> {
-        self.cell_num += 1;
-        if self.cell_num >= ROWS_PER_PAGE {
-            self.page_num += 1;
-            self.cell_num = 0;
-        }
+        self.row_num += 1;
 
-        if self.page_num >= self.table.num_rows {
+        if self.row_num >= self.table.num_rows {
             self.end_of_table = true;
         }
 
         Ok(())
     }
 
-    fn current_position(&self) -> usize {
-        self.page_num * ROWS_PER_PAGE + self.cell_num
-    }
-
-    fn value(&mut self) -> io::Result<&mut Row> {
-        let row_num = self.current_position();
-        self.table.row_slot(row_num)
+    fn value(&mut self) -> io::Result<Option<&mut Row>> {
+        if self.end_of_table {
+            Ok(None)
+        } else {
+            self.table.row_slot(self.row_num).map(Some)
+        }
     }
 }
 
@@ -142,10 +132,10 @@ impl Pager {
             self.file.flush()?;
 
             // Update file_length if necessary
-            let end_of_page = ((page_num + 1) * PAGE_SIZE) as u64;
-            if end_of_page > self.file_length as u64 {
-                self.file_length = end_of_page as usize;
-                self.file.set_len(end_of_page)?;
+            let end_of_write = ((page_num * PAGE_SIZE) + size) as u64;
+            if end_of_write > self.file_length as u64 {
+                self.file_length = end_of_write as usize;
+                self.file.set_len(end_of_write)?;
             }
         }
         Ok(())
@@ -168,7 +158,17 @@ impl Pager {
                 println!("Reading page {} from file", page_num);
                 self.file
                     .seek(SeekFrom::Start((page_num * PAGE_SIZE) as u64))?;
-                self.file.read_exact(page.as_mut_slice())?;
+                let bytes_read = self.file.read(&mut page[..])?;
+
+                if bytes_read < PAGE_SIZE && page_num == num_pages - 1 {
+                    // This is fine, we've read a partial last page
+                    println!("Read partial page: {} bytes", bytes_read);
+                } else if bytes_read < PAGE_SIZE {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "Failed to read full page",
+                    ));
+                }
             } else {
                 println!("Initializing new page {}", page_num);
             }
@@ -220,37 +220,24 @@ impl Table {
             return Err(io::Error::new(io::ErrorKind::Other, "Error: Table full."));
         }
 
-        let mut cursor = Cursor::table_end(self)?;
-        let row_slot = match cursor.value() {
-            Ok(row) => row,
-            Err(error) => {
-                println!("Error: {}", error);
-                return Ok(());
-            }
-        };
-        *row_slot = row;
+        let row_num = self.num_rows;
+        let page_num = row_num / ROWS_PER_PAGE;
+        let row_offset = row_num % ROWS_PER_PAGE;
+        let byte_offset = row_offset * ROW_SIZE;
+
+        let page = self.pager.get_page(page_num)?;
+        unsafe {
+            std::ptr::write(page[byte_offset..].as_mut_ptr() as *mut Row, row);
+        }
+
         self.num_rows += 1;
 
-        // Flush the page containing the new row
-        let page_num = (self.num_rows - 1) / ROWS_PER_PAGE;
-        let used_size = ((self.num_rows - 1) % ROWS_PER_PAGE + 1) * ROW_SIZE;
-        println!("Inserting row at index {}", self.num_rows - 1);
-        self.pager.flush(page_num, used_size)?;
+        // Flush only the inserted row
+        self.pager.flush(page_num, byte_offset + ROW_SIZE)?;
+
+        println!("Inserted row at index {}", row_num);
 
         Ok(())
-    }
-
-    fn find(&mut self, id: u32) -> io::Result<Cursor> {
-        let mut cursor = Cursor::table_start(self)?;
-        while !cursor.end_of_table {
-            let row = cursor.value()?;
-            match row.id.cmp(&id) {
-                Ordering::Equal => return Ok(cursor),
-                Ordering::Greater => break,
-                Ordering::Less => cursor.advance()?,
-            }
-        }
-        Ok(cursor)
     }
 }
 
@@ -342,40 +329,31 @@ fn prepare_statement(input: &str) -> Result<Statement, &'static str> {
 fn execute_statement(statement: &Statement, table: &mut Table) -> io::Result<()> {
     match statement.statement_type {
         StatementType::Insert => match &statement.row_to_insert {
-            Some(row) => {
-                match table.insert(*row) {
-                    Ok(()) => {
-                        println!("Inserted");
-                    }
-                    Err(e) => println!("Error inserting row: {}", e),
+            Some(row) => match table.insert(*row) {
+                Ok(()) => {
+                    println!("Inserted");
                 }
-
-                println!("Executed.");
-            }
+                Err(e) => println!("Error inserting row: {}", e),
+            },
             None => println!("Error: No row to insert."),
         },
         StatementType::Select => {
             let mut cursor = Cursor::table_start(table)?;
 
             while !cursor.end_of_table {
-                match cursor.value() {
-                    Ok(row) => {
-                        println!(
-                            "({}, {}, {})",
-                            row.id,
-                            std::str::from_utf8(&row.username)
-                                .unwrap()
-                                .trim_end_matches('\0'),
-                            std::str::from_utf8(&row.email)
-                                .unwrap()
-                                .trim_end_matches('\0')
-                        );
-                    }
-                    Err(e) => println!("Error reading row : {}", e),
+                if let Some(row) = cursor.value()? {
+                    println!(
+                        "({}, {}, {})",
+                        row.id,
+                        std::str::from_utf8(&row.username)
+                            .unwrap()
+                            .trim_end_matches('\0'),
+                        std::str::from_utf8(&row.email)
+                            .unwrap()
+                            .trim_end_matches('\0')
+                    );
                 }
-                if let Err(error) = cursor.advance() {
-                    println!("Error advancing cursor: {}", error);
-                }
+                cursor.advance()?;
             }
             println!("Executed.");
         }
