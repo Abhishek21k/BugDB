@@ -1,26 +1,16 @@
+mod sql_parser;
+
 use std::{
+    collections::HashMap,
     fs::{File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
     mem,
 };
 
+use sql_parser::{prepare_statement, Row, Statement, StatementType, Value, WhereClause};
+
 const PAGE_SIZE: usize = 4096;
 const TABLE_MAX_PAGES: usize = 100;
-const ROW_SIZE: usize = mem::size_of::<Row>();
-const ROWS_PER_PAGE: usize = PAGE_SIZE / ROW_SIZE;
-const TABLE_MAX_ROWS: usize = ROWS_PER_PAGE * TABLE_MAX_PAGES;
-
-enum StatementType {
-    Insert,
-    Select,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct Row {
-    id: u32,
-    username: [u8; 32],
-    email: [u8; 255],
-}
 
 struct Cursor<'a> {
     table: &'a mut Table,
@@ -30,40 +20,14 @@ struct Cursor<'a> {
 
 struct Pager {
     file: File,
-    pages: Vec<Option<Box<[u8; PAGE_SIZE]>>>,
+    pages: Vec<Option<Vec<u8>>>,
     file_length: usize,
 }
 
 struct Table {
     pager: Pager,
     num_rows: usize,
-}
-
-struct Statement {
-    statement_type: StatementType,
-    row_to_insert: Option<Row>,
-}
-
-impl Row {
-    fn new(id: u32, username: &str, email: &str) -> Result<Row, &'static str> {
-        let mut row = Row {
-            id,
-            username: [0; 32],
-            email: [0; 255],
-        };
-
-        if username.len() > 32 {
-            return Err("Username too long");
-        }
-        if email.len() > 255 {
-            return Err("Email too long");
-        }
-
-        row.username[..username.len()].copy_from_slice(username.as_bytes());
-        row.email[..email.len()].copy_from_slice(email.as_bytes());
-
-        Ok(row)
-    }
+    columns: Vec<String>,
 }
 
 impl<'a> Cursor<'a> {
@@ -73,16 +37,6 @@ impl<'a> Cursor<'a> {
             table,
             row_num: 0,
             end_of_table,
-        };
-        Ok(cursor)
-    }
-
-    fn table_end(table: &'a mut Table) -> io::Result<Cursor<'a>> {
-        let num_rows = table.num_rows;
-        let cursor = Cursor {
-            table,
-            row_num: num_rows,
-            end_of_table: true,
         };
         Ok(cursor)
     }
@@ -97,11 +51,11 @@ impl<'a> Cursor<'a> {
         Ok(())
     }
 
-    fn value(&mut self) -> io::Result<Option<&mut Row>> {
+    fn value(&mut self) -> io::Result<Option<Row>> {
         if self.end_of_table {
             Ok(None)
         } else {
-            self.table.row_slot(self.row_num).map(Some)
+            self.table.row_slot(self.row_num)
         }
     }
 }
@@ -141,7 +95,7 @@ impl Pager {
         Ok(())
     }
 
-    fn get_page(&mut self, page_num: usize) -> io::Result<&mut [u8; PAGE_SIZE]> {
+    fn get_page(&mut self, page_num: usize) -> io::Result<&mut Vec<u8>> {
         if page_num >= TABLE_MAX_PAGES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -150,7 +104,7 @@ impl Pager {
         }
 
         if self.pages[page_num].is_none() {
-            let mut page = Box::new([0; PAGE_SIZE]);
+            let mut page = vec![0; PAGE_SIZE];
 
             let num_pages = (self.file_length as f64 / PAGE_SIZE as f64).ceil() as usize;
 
@@ -161,8 +115,7 @@ impl Pager {
                 let bytes_read = self.file.read(&mut page[..])?;
 
                 if bytes_read < PAGE_SIZE && page_num == num_pages - 1 {
-                    // This is fine, we've read a partial last page
-                    println!("Read partial page: {} bytes", bytes_read);
+                    page.truncate(bytes_read);
                 } else if bytes_read < PAGE_SIZE {
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
@@ -181,63 +134,107 @@ impl Pager {
 }
 
 impl Table {
-    fn new(filename: &str) -> io::Result<Table> {
+    fn new(filename: &str, columns: Vec<String>) -> io::Result<Table> {
         let pager: Pager = Pager::new(filename)?;
-        let num_rows: usize = pager.file_length / ROW_SIZE;
-        Ok(Table { pager, num_rows })
+        let num_rows: usize = pager.file_length / Self::row_size(&columns);
+        Ok(Table {
+            pager,
+            num_rows,
+            columns,
+        })
+    }
+
+    fn row_size(columns: &[String]) -> usize {
+        columns.len() * std::mem::size_of::<Value>()
     }
 
     fn close(&mut self) -> io::Result<()> {
-        let full_pages: usize = self.num_rows / ROWS_PER_PAGE;
+        let row_size = Self::row_size(&self.columns);
+        let full_pages = self.num_rows * row_size / PAGE_SIZE;
         for i in 0..full_pages {
             if self.pager.pages[i].is_some() {
                 self.pager.flush(i, PAGE_SIZE)?;
             }
         }
 
-        let additional_rows = self.num_rows % ROWS_PER_PAGE;
+        let additional_rows = self.num_rows % (PAGE_SIZE / row_size);
         if additional_rows > 0 {
             let page_num = full_pages;
             if self.pager.pages[page_num].is_some() {
-                self.pager.flush(page_num, additional_rows * ROW_SIZE)?;
+                self.pager.flush(page_num, additional_rows * row_size)?;
             }
         }
 
-        println!("Closed table with {} rows", self.num_rows);
         Ok(())
     }
 
-    fn row_slot(&mut self, row_num: usize) -> io::Result<&mut Row> {
-        let page_num = row_num / ROWS_PER_PAGE;
+    fn row_slot(&mut self, row_num: usize) -> io::Result<Option<Row>> {
+        let row_size = Self::row_size(&self.columns);
+        let page_num = row_num * row_size / PAGE_SIZE;
+        let row_offset = row_num % (PAGE_SIZE / row_size);
+        let byte_offset = row_offset * row_size;
+
         let page = self.pager.get_page(page_num)?;
-        let row_offset = row_num % ROWS_PER_PAGE;
-        let byte_offset = row_offset * ROW_SIZE;
-        Ok(unsafe { &mut *(page[byte_offset..].as_mut_ptr() as *mut Row) })
+        if byte_offset >= page.len() {
+            return Ok(None);
+        }
+
+        let mut row = Row::new();
+        for (i, column) in self.columns.iter().enumerate() {
+            let value_offset = byte_offset + i * std::mem::size_of::<Value>();
+            let value = Self::deserialize_value(&page[value_offset..]);
+            row.values.insert(column.clone(), value);
+        }
+
+        Ok(Some(row))
     }
 
     fn insert(&mut self, row: Row) -> io::Result<()> {
-        if self.num_rows >= TABLE_MAX_ROWS {
-            return Err(io::Error::new(io::ErrorKind::Other, "Error: Table full."));
-        }
-
-        let row_num = self.num_rows;
-        let page_num = row_num / ROWS_PER_PAGE;
-        let row_offset = row_num % ROWS_PER_PAGE;
-        let byte_offset = row_offset * ROW_SIZE;
+        let row_size = self.serialize_row(&row).len();
+        let page_num = self.num_rows * row_size / PAGE_SIZE;
+        let row_offset = self.num_rows % (PAGE_SIZE / row_size);
+        let byte_offset = row_offset * row_size;
 
         let page = self.pager.get_page(page_num)?;
-        unsafe {
-            std::ptr::write(page[byte_offset..].as_mut_ptr() as *mut Row, row);
+        if byte_offset + row_size > page.len() {
+            page.resize(byte_offset + row_size, 0);
         }
 
+        let serialized_row = self.serialize_row(&row);
+        let page = self.pager.get_page(page_num)?;
+        page[byte_offset..byte_offset + row_size].copy_from_slice(&serialized_row);
+
         self.num_rows += 1;
-
-        // Flush only the inserted row
-        self.pager.flush(page_num, byte_offset + ROW_SIZE)?;
-
-        println!("Inserted row at index {}", row_num);
+        self.pager.flush(page_num, byte_offset + row_size)?;
 
         Ok(())
+    }
+
+    fn serialize_row(&self, row: &Row) -> Vec<u8> {
+        let mut buffer = Vec::new();
+        for column in &self.columns {
+            match row.values.get(column) {
+                Some(Value::Integer(i)) => buffer.extend_from_slice(&i.to_le_bytes()),
+                Some(Value::Text(s)) => {
+                    buffer.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                    buffer.extend_from_slice(s.as_bytes());
+                }
+                None => buffer.extend_from_slice(&[0; 8]), // Default to 8 bytes of zeros for missing values
+            }
+        }
+        buffer
+    }
+
+    fn deserialize_value(buffer: &[u8]) -> Value {
+        if buffer.len() >= 8 {
+            Value::Integer(i64::from_le_bytes([
+                buffer[0], buffer[1], buffer[2], buffer[3], buffer[4], buffer[5], buffer[6],
+                buffer[7],
+            ]))
+        } else {
+            let len = u32::from_le_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]) as usize;
+            Value::Text(String::from_utf8_lossy(&buffer[4..4 + len]).to_string())
+        }
     }
 }
 
@@ -248,7 +245,13 @@ fn main() -> io::Result<()> {
         return Ok(());
     }
     let filename = &args[1];
-    let mut table = Table::new(filename)?;
+
+    let columns = vec![
+        "id".to_string(),
+        "username".to_string(),
+        "email".to_string(),
+    ];
+    let mut table = Table::new(filename, columns)?;
 
     loop {
         print_prompt();
@@ -302,56 +305,24 @@ fn do_meta_command(input: &str, table: &mut Table) -> io::Result<()> {
     }
 }
 
-// New: Function to prepare statements
-fn prepare_statement(input: &str) -> Result<Statement, &'static str> {
-    if input.starts_with("insert") {
-        let parts: Vec<&str> = input.split_whitespace().collect();
-        if parts.len() != 4 {
-            return Err("Syntax error. Use: insert ID USERNAME EMAIL");
-        }
-        let id: u32 = parts[1].parse().map_err(|_| "Invalid ID")?;
-        let row = Row::new(id, parts[2], parts[3])?;
-        Ok(Statement {
-            statement_type: StatementType::Insert,
-            row_to_insert: Some(row),
-        })
-    } else if input.starts_with("select") {
-        Ok(Statement {
-            statement_type: StatementType::Select,
-            row_to_insert: None,
-        })
-    } else {
-        Err("Unrecognized keyword at start of statement")
-    }
-}
-
 // New: Function to execute statements
 fn execute_statement(statement: &Statement, table: &mut Table) -> io::Result<()> {
     match statement.statement_type {
-        StatementType::Insert => match &statement.row_to_insert {
-            Some(row) => match table.insert(*row) {
-                Ok(()) => {
-                    println!("Inserted");
-                }
+        StatementType::Insert => {
+            let mut row = Row::new();
+            for (column, value) in statement.columns.iter().zip(statement.values.iter()) {
+                row.values.insert(column.clone(), value.clone());
+            }
+            match table.insert(row) {
+                Ok(()) => println!("Inserted"),
                 Err(e) => println!("Error inserting row: {}", e),
-            },
-            None => println!("Error: No row to insert."),
-        },
+            }
+        }
         StatementType::Select => {
             let mut cursor = Cursor::table_start(table)?;
-
             while !cursor.end_of_table {
                 if let Some(row) = cursor.value()? {
-                    println!(
-                        "({}, {}, {})",
-                        row.id,
-                        std::str::from_utf8(&row.username)
-                            .unwrap()
-                            .trim_end_matches('\0'),
-                        std::str::from_utf8(&row.email)
-                            .unwrap()
-                            .trim_end_matches('\0')
-                    );
+                    print_row(&row, &statement.columns);
                 }
                 cursor.advance()?;
             }
@@ -359,4 +330,58 @@ fn execute_statement(statement: &Statement, table: &mut Table) -> io::Result<()>
         }
     }
     Ok(())
+}
+
+fn matches_where_clause(row: &Row, where_clause: &Option<WhereClause>) -> bool {
+    match where_clause {
+        Some(clause) => {
+            if let Some(value) = row.values.get(&clause.column) {
+                match (&clause.operator[..], &clause.value) {
+                    ("=", Value::Integer(i)) => {
+                        if let Value::Integer(row_i) = value {
+                            row_i == i
+                        } else {
+                            false
+                        }
+                    }
+                    ("=", Value::Text(s)) => {
+                        if let Value::Text(row_s) = value {
+                            row_s == s
+                        } else {
+                            false
+                        }
+                    }
+                    // Add more operators as needed
+                    _ => false,
+                }
+            } else {
+                false
+            }
+        }
+        None => true,
+    }
+}
+
+fn print_row(row: &Row, columns: &[String]) {
+    let values: Vec<String> = if columns[0] == "*" {
+        row.values.iter().map(|(_, v)| value_to_string(v)).collect()
+    } else {
+        columns
+            .iter()
+            .map(|col| {
+                row.values
+                    .get(col)
+                    .map(|v| value_to_string(v))
+                    .unwrap_or_else(|| "NULL".to_string())
+            })
+            .collect()
+    };
+    println!("({})", values.join(", "));
+}
+
+fn value_to_string(value: &Value) -> String {
+    match value {
+        Value::Integer(i) => i.to_string(),
+        Value::Text(s) => format!("'{}'", s),
+    }
 }
